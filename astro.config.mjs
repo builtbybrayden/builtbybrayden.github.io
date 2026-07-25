@@ -7,6 +7,9 @@ import { defineConfig, fontProviders } from 'astro/config';
 // https://astro.build/config
 export default defineConfig({
 	site: 'https://builtbybrayden.github.io',
+	redirects: {
+		'/': '/blog',
+	},
 	integrations: [mdx(), sitemap()],
 	fonts: [
 		{
