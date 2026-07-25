@@ -1,42 +1,34 @@
 ---
-title: 'How a Missing Company Check Let Any Snipe-IT User Move Maintenance Records Between Companies'
-description: 'A mass-assignment bug in the Snipe-IT Maintenances API let a user in one company re-parent maintenance records onto assets in another. CVE-2026-55516, CVSS 7.7.'
+title: 'CVE-2026-55516: How a Missing Check Let Snipe-IT Users Reach Into Another Company''s Data'
+description: 'A missing permission check in Snipe-IT let one company silently attach maintenance records to another company''s equipment. Rated High severity, CVSS 7.7.'
 pubDate: '2026-07-25'
 ---
 
-## Background
+## The short version
 
-Snipe-IT supports a multi-tenant mode called Full Multiple Companies Support (FMCS), aimed at organizations that run several separate business units, subsidiaries, or clients out of a single Snipe-IT instance. The entire point of FMCS is that a user scoped to Company A cannot see or touch Company B's data. Snipe-IT enforces that boundary consistently on reads. This finding is about a place where it didn't enforce it on writes.
+Snipe-IT is an open source tool a lot of IT teams use to track laptops, software licenses, and other equipment. It has a mode built for organizations that manage several separate companies out of one account, each company's data walled off from the others. I found a bug where that wall had a gap: a user in one company could attach maintenance records to equipment belonging to a company they weren't supposed to see at all. No error, no warning, nothing in the interface hinted it had happened.
 
-## The vulnerability class
+It's fixed now. The bug is tracked as **CVE-2026-55516**, rated High severity (CVSS 7.7).
 
-This is a mass-assignment bug (CWE-915) that turns into an authorization bypass through a user-controlled key (CWE-639) and, more broadly, improper authorization (CWE-285). The pattern shows up constantly in web apps: a controller checks whether the caller can perform an action in general, but never checks whether the specific object the caller is targeting is one they're allowed to touch.
+## Some background
 
-## Root cause
+If you're not familiar with Snipe-IT: it's the kind of software an IT department uses to answer "who has laptop #4471, when did it last get serviced, and is the warranty still good." A lot of organizations that manage IT for multiple companies at once, think a managed service provider, or a parent company with several subsidiaries, use a feature called Full Multiple Companies Support (FMCS). The idea is simple: one Snipe-IT account, several companies inside it, and a hard rule that a user tied to Company A should never be able to see or touch Company B's equipment.
 
-I first confirmed FMCS was actually being enforced elsewhere, as a control. Requesting an asset that belongs to a different company through the read API returns a clean rejection:
+Snipe-IT gets this right almost everywhere. If a Company A user asks the system to show them an asset that belongs to Company B, they get told it doesn't exist, a clean, correct rejection. I went looking for a place where that rule wasn't actually being enforced, and found one in the part of the app that handles maintenance records (the repair history, service dates, and costs tied to a piece of equipment).
 
-```bash
-curl -H "Authorization: Bearer $TOKEN" http://.../api/v1/hardware/2
-# {"status":"error","messages":"Asset does not exist."}
-```
+## What went wrong
 
-So the platform does the right thing on reads. The Maintenances controller didn't match that on writes.
+Picture two companies sharing the same Snipe-IT account, each with their own set of laptops and other gear. The system is supposed to work like two locked filing cabinets in the same room: Company A has a key to their cabinet, Company B has a key to theirs, and neither can open the other's drawer.
 
-`MaintenancesController::store()` authorized only at the class level, `$this->authorize('update', Asset::class)`, and never checked whether the caller-supplied `asset_id` belonged to a company they had access to:
+The maintenance-records feature had two ways to create or update a record, and both of them let a user write into the wrong cabinet if they simply mentioned the right asset ID.
 
-```php
-public function store(ImageUploadRequest $request): JsonResponse|array
-{
-    $this->authorize('update', Asset::class);      // class-level, no asset_id check
-    $maintenance = new AssetMaintenance;
-    $maintenance->fill($request->all());            // writes attacker's asset_id straight through
-    $maintenance->user_id = Auth::id();
-    // ...
-}
-```
+**Creating a new maintenance record.** The endpoint checked whether you were generally allowed to create maintenance records at all, but never checked whether the specific piece of equipment you named actually belonged to your company. So a Company A user could submit "create a maintenance record for asset #2" even when asset #2 belonged to Company B, and the system would go ahead and create it.
 
-`update()` was subtler. It checked tenancy on the maintenance record's *current* asset before the fill, which looks correct at a glance, but then filled the request body (which can include a new `asset_id`) and saved without ever re-checking the *new* target:
+**Updating an existing record.** This one was sneakier. When you asked to update a maintenance record, the system correctly checked whether you had rights to the equipment the record was *currently* attached to. That check passes, because you do own that record. But the same request could also include a change of which asset the record points to, and the system never re-checked that new target. So you could take a maintenance record you legitimately own, and quietly re-point it at a piece of equipment belonging to a different company, and the second check that should have caught this simply never ran.
+
+If you want the technical framing: this is a mass-assignment bug (CWE-915, a class of vulnerability where user-supplied fields get written to the database without the right checks) that turns into a full authorization bypass through a user-controlled key (CWE-639) and, more broadly, improper authorization (CWE-285). The field being trusted, the target asset ID, was exactly the thing that should have determined whether the action was allowed at all.
+
+Here's the code for the update path, which is the more interesting of the two. It checks access to the *old* asset, then quietly lets the request swap in a new one:
 
 ```php
 public function update(Request $request, $id): JsonResponse|array
@@ -53,47 +45,33 @@ public function update(Request $request, $id): JsonResponse|array
 }
 ```
 
-Pre-fill checks on post-fill data are a recurring failure shape. The check runs against state that's about to be replaced.
+The lesson generalizes past this one bug: when a request can change which record it points to, checking permissions on the *old* target and then trusting the *new* one is a gap, and it's an easy one to introduce by accident because the code reads as correct at a glance.
 
-## Proof of concept
+## How I found it and proved it
 
-Working in an isolated Docker lab with two companies seeded (Company A with one asset, Company B with two), I created a user scoped to Company A with ordinary asset permissions (view, edit, create) and no superuser flag.
+I do this kind of research in an isolated lab, never against a live company's data. I set up a local copy of Snipe-IT with two fake companies: Company A with one piece of equipment, Company B with two. I created a test user belonging to Company A with completely ordinary permissions, no admin rights, nothing special.
 
-**Store path.** A single POST with a Company B asset ID succeeded outright:
+From there, two tests:
 
-```bash
-curl -X POST .../api/v1/maintenances \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"name":"cross-tenant-test","asset_id":2,"asset_maintenance_type":"Repair", ...}'
-# 200 success
-```
+**Test one.** As the Company A user, I sent a request to create a new maintenance record and pointed it at one of Company B's assets. It worked. The record was created, owned by a Company A user, attached to Company B equipment.
 
-The resulting database row showed exactly the mismatch FMCS is supposed to prevent: the maintenance record's creator belonged to Company A, but the asset it referenced belonged to Company B.
+**Test two.** I had the same user create a legitimate maintenance record on their own company's equipment first, then sent a follow-up request changing which asset it pointed to, aiming it at a Company B asset instead. That also worked, silently re-parenting a record the user had no business touching.
 
-**Update path.** I had the test user legitimately create a maintenance record on her own company's asset, then PATCH that same record's `asset_id` to point at a Company B asset:
+Neither test produced an error message, a warning, or anything a normal user or an administrator watching the system would notice.
 
-```bash
-curl -X PUT .../api/v1/maintenances/2 -H "Authorization: Bearer $TOKEN" -d '{"asset_id":2}'
-# 200 success
-```
+## Why this matters
 
-Same result: a maintenance record now attached to an asset in a company the test user has no read access to whatsoever.
-
-## Impact
-
-A user in one company can attribute maintenance history, cost data, and repair events to assets belonging to a company they can't even see through the normal UI. For an organization using Snipe-IT as the system of record for asset lifecycle and chargeback reporting, that's a quiet integrity problem: reports that aggregate by company can be polluted by users who were never supposed to have any visibility into that company's inventory. The bug is silent. Neither company gets an error or a warning.
-
-The update-path variant carries a CVSS 3.1 score of 7.7 (High), vector `AV:N/AC:L/PR:L/UI:N/S:C/C:N/I:H/A:N`, per Grokability's published scoring.
+If your organization uses Snipe-IT to keep an accurate, trustworthy record of equipment maintenance, warranty status, and repair costs (which is the whole point of the tool), this bug meant that record could be quietly polluted by people who weren't supposed to have any visibility into your company at all. A managed service provider running several client companies through one account is exactly the deployment shape where this bites hardest: one client's maintenance history could get contaminated by another client's activity, with no way to tell it happened until someone went looking.
 
 ## Timeline
 
-Reported to `security@snipeitapp.com` on May 2, 2026. Grokability fixed the store path within about two days, in commit [`0daec32ddd52`](https://github.com/grokability/snipe-it/commit/0daec32ddd52ca355ea48c73996befb592733e54), by introducing a dedicated maintenance permission and policy. The update path took a bit longer, landing about six weeks later in commit [`905d498ecdb0`](https://github.com/grokability/snipe-it/commit/905d498ecdb0ee5591231c97bf48435e92044368), shipped in v8.6.2. Both paths are confirmed fixed.
+I reported this to Snipe-IT's maintainer, Grokability, on May 2, 2026. They fixed the "create" path within about two days. The trickier "update" path took longer to land, about six weeks, and shipped in version 8.6.2. Both are confirmed fixed as of this writing.
 
-The update-path variant is now public as [GHSA-575r-357h-fhch](https://github.com/grokability/snipe-it/security/advisories/GHSA-575r-357h-fhch) / **CVE-2026-55516**. Another researcher, 5h1kh4r, independently found and reported the same update-path bug, and Grokability credited both of us as reporters on the published advisory. The store-path variant doesn't have a separate public CVE at this time.
+The update-path fix is documented publicly as [GHSA-575r-357h-fhch](https://github.com/grokability/snipe-it/security/advisories/GHSA-575r-357h-fhch), assigned **CVE-2026-55516**. Another researcher, 5h1kh4r, independently found and reported the same bug around the same time, and Grokability credited both of us as reporters on the published advisory, which is exactly the right way to handle that kind of overlap.
 
 ## The fix
 
-The update-path fix does exactly what was missing: it re-resolves and re-authorizes against the *new* asset ID before saving, instead of trusting the pre-fill check.
+The fix does the thing that was missing: before saving the update, it re-checks whether the user actually has access to the *new* asset, not just the old one.
 
 ```php
 if ($request->filled('asset_id') && (int) $request->input('asset_id') !== $maintenance->asset_id) {
@@ -113,7 +91,7 @@ if ($request->filled('asset_id') && (int) $request->input('asset_id') !== $maint
 
 ## Takeaway
 
-When a write path accepts a foreign key from the request body, the authorization check has to run against the value that key resolves to *after* the request is applied, not before. A tenancy check performed on stale, pre-fill state gives you the comforting appearance of a guard rail without the guard rail actually being there for the field that matters.
+If your application lets a request change which record something points to, whether that's a company, a user, or an asset like here, the permission check needs to run against where the request is trying to go, not where it started. A check performed against the old, about-to-be-replaced state gives you the appearance of a guard rail without the guard rail actually doing its job on the field that matters most.
 
 ---
 
