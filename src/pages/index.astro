@@ -1,0 +1,29 @@
+---
+import BaseHead from '../components/BaseHead.astro';
+import Footer from '../components/Footer.astro';
+import Header from '../components/Header.astro';
+import { SITE_DESCRIPTION, SITE_TITLE } from '../consts';
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<BaseHead title={SITE_TITLE} description={SITE_DESCRIPTION} />
+	</head>
+	<body>
+		<Header />
+		<main>
+			<h1>Brayden Arnold</h1>
+			<p>
+				I'm a penetration tester working toward OSCP. This site is where I publish coordinated
+				vulnerability disclosures, bug bounty writeups, and notes from CTFs and certification
+				study, once a fix has shipped and it's safe to talk about.
+			</p>
+			<p>
+				Start with the <a href="/blog">blog</a> for writeups, or read
+				<a href="/about">more about me</a>.
+			</p>
+		</main>
+		<Footer />
+	</body>
+</html>
