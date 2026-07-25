@@ -8,7 +8,7 @@ pubDate: '2026-07-25'
 
 Snipe-IT is an open source tool a lot of IT teams use to track laptops, software licenses, and other equipment. It has a mode built for organizations that manage several separate companies out of one account, each company's data walled off from the others. I found a bug where that wall had a gap: a user in one company could attach maintenance records to equipment belonging to a company they weren't supposed to see at all. No error, no warning, nothing in the interface hinted it had happened.
 
-It's fixed now. The bug is tracked as **CVE-2026-55516**, rated High severity (CVSS 7.7).
+Both are fixed now. The update-path version, the more serious of the two, is tracked as **CVE-2026-55516** (CVSS 7.7, High). The create-path version was fixed earlier and does not have its own CVE number, but it is the same underlying pattern and worth walking through alongside it.
 
 ## Some background
 
